@@ -1,14 +1,34 @@
-# Welcome to your CDK TypeScript project
+# Video Processor
 
-This is a blank project for CDK development with TypeScript.
+Procesa videos MP4 subidos a S3 generando múltiples versiones de calidad.
+La infraestructura se despliega con AWS CDK.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+## Arquitectura
 
-## Useful commands
+```
+S3 (videos-input/)
+       ↓
+  Lambda (trigger)
+       ↓
+  Step Function
+       ↓
+  Paso 1 → Paso 2 → ... → Paso N
+```
 
-* `npm run build`   compile typescript to js
-* `npm run watch`   watch for changes and compile
-* `npm run test`    perform the jest unit tests
-* `npx cdk deploy`  deploy this stack to your default AWS account/region
-* `npx cdk diff`    compare deployed stack with current state
-* `npx cdk synth`   emits the synthesized CloudFormation template
+## Pasos de procesamiento
+
+Cada video subido genera un registro en DynamoDB con los campos:
+`currentStep`, `totalSteps`, `stepName`, `status`, `createdAt`, `updatedAt`
+
+| # | stepName | Descripción |
+|---|----------|-------------|
+| 1 | `GENERATING_QUALITIES` | Se registra el job en DynamoDB y se dispara el transcodeo en MediaConvert (240p, 360p, 480p, 720p, 1080p) |
+| 2 | TBD | Se ejecuta cuando MediaConvert finaliza |
+
+## Comandos
+
+```bash
+npx cdk deploy   # Deploy
+npx cdk diff     # Preview de cambios
+npx cdk destroy  # Eliminar stack
+```

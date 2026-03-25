@@ -4,13 +4,12 @@ const client = new MediaConvertClient({
   endpoint: process.env.MEDIACONVERT_ENDPOINT as string,
 });
 
-export const handler = async (event: any) => {
+export const handler = async (event: { bucket: string; key: string; videoId: string }) => {
   console.log("Evento recibido:", JSON.stringify(event, null, 2));
 
   try {
-    const record = event.Records[0];
-    const sourceBucket = record.s3.bucket.name;
-    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+    const sourceBucket = event.bucket;
+    const key = event.key;
 
     // Casteamos las variables de entorno a string
     const destinationBucket = process.env.VIDEO_BUCKET as string;
