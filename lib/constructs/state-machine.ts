@@ -11,6 +11,7 @@ export interface StateMachineConstructProps {
   qualitiesLaunchFn: lambda.IFunction;
   highlightsLaunchFn: lambda.IFunction;
   twelvelabsFn: lambda.IFunction;
+  bedrockModelId: string;
 }
 
 export class StateMachineConstruct extends Construct {
@@ -19,13 +20,14 @@ export class StateMachineConstruct extends Construct {
   constructor(scope: Construct, id: string, props: StateMachineConstructProps) {
     super(scope, id);
 
-    const { stage, jobsTable, qualitiesLaunchFn, highlightsLaunchFn, twelvelabsFn } = props;
+    const { stage, jobsTable, qualitiesLaunchFn, highlightsLaunchFn, twelvelabsFn, bedrockModelId } = props;
 
     const definition = buildDefinition(this, {
       jobsTable,
       qualitiesLaunchFn,
       highlightsLaunchFn,
       twelvelabsFn,
+      bedrockModelId,
     });
 
     this.stateMachine = new sfn.StateMachine(this, 'StateMachine', {
@@ -34,18 +36,10 @@ export class StateMachineConstruct extends Construct {
       timeout: cdk.Duration.hours(2),
     });
 
-    // Permisos para que Step Functions invoque los Lambdas
     qualitiesLaunchFn.grantInvoke(this.stateMachine.role);
     highlightsLaunchFn.grantInvoke(this.stateMachine.role);
     twelvelabsFn.grantInvoke(this.stateMachine.role);
 
-    // Permisos para Step Functions → DynamoDB
     jobsTable.grantWriteData(this.stateMachine.role);
-
-    // Permisos para Step Functions → Bedrock
-    this.stateMachine.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
-      actions: ['bedrock:InvokeModel', 'bedrock-runtime:StartAsyncInvoke'],
-      resources: ['*'],
-    }));
   }
 }

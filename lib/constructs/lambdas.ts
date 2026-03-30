@@ -9,8 +9,7 @@ import * as path from 'path';
 
 export interface LambdasProps {
   stage: string;
-  inputBucket: s3.IBucket;
-  outputBucket: s3.IBucket;
+  bucket: s3.IBucket;
   jobsTable: dynamodb.ITable;
   mediaConvertRoleArn: string;
   mediaConvertEndpoint: string;
@@ -30,8 +29,7 @@ export class Lambdas extends Construct {
 
     const {
       stage,
-      inputBucket,
-      outputBucket,
+      bucket,
       jobsTable,
       mediaConvertRoleArn,
       mediaConvertEndpoint,
@@ -48,13 +46,13 @@ export class Lambdas extends Construct {
       timeout: cdk.Duration.seconds(15),
       environment: {
         TABLE_NAME: jobsTable.tableName,
-        OUTPUT_BUCKET: outputBucket.bucketName,
+        BUCKET: bucket.bucketName,
         STATE_MACHINE_ARN: stateMachineArn,
       },
     });
 
     jobsTable.grantWriteData(this.orchestrator);
-    outputBucket.grantPut(this.orchestrator);
+    bucket.grantPut(this.orchestrator);
     this.orchestrator.addToRolePolicy(new iam.PolicyStatement({
       actions: ['states:StartExecution'],
       resources: [stateMachineArn],
@@ -65,6 +63,7 @@ export class Lambdas extends Construct {
     const mediaConvertEnv = {
       MEDIACONVERT_ENDPOINT: mediaConvertEndpoint,
       MEDIACONVERT_ROLE_ARN: mediaConvertRoleArn,
+      TABLE_NAME: jobsTable.tableName,
     };
 
     this.qualitiesLaunch = new nodejs.NodejsFunction(this, 'QualitiesLaunch', {
@@ -80,7 +79,8 @@ export class Lambdas extends Construct {
       actions: ['mediaconvert:CreateJob', 'iam:PassRole'],
       resources: ['*'],
     }));
-    inputBucket.grantRead(this.qualitiesLaunch);
+    bucket.grantRead(this.qualitiesLaunch);
+    jobsTable.grantWriteData(this.qualitiesLaunch);
 
     this.qualitiesCallback = new nodejs.NodejsFunction(this, 'QualitiesCallback', {
       functionName: `video-processor-${stage}-qualities-callback`,
@@ -88,12 +88,14 @@ export class Lambdas extends Construct {
       entry: path.join(__dirname, '../../lambda/qualities/index.ts'),
       handler: 'callback',
       timeout: cdk.Duration.seconds(10),
+      environment: { TABLE_NAME: jobsTable.tableName },
     });
 
     this.qualitiesCallback.addToRolePolicy(new iam.PolicyStatement({
       actions: ['states:SendTaskSuccess', 'states:SendTaskFailure'],
       resources: ['*'],
     }));
+    jobsTable.grantReadData(this.qualitiesCallback);
 
     // ── Highlights ──────────────────────────────────────────────────────────────
 
@@ -110,7 +112,8 @@ export class Lambdas extends Construct {
       actions: ['mediaconvert:CreateJob', 'iam:PassRole'],
       resources: ['*'],
     }));
-    inputBucket.grantRead(this.highlightsLaunch);
+    bucket.grantRead(this.highlightsLaunch);
+    jobsTable.grantWriteData(this.highlightsLaunch);
 
     this.highlightsCallback = new nodejs.NodejsFunction(this, 'HighlightsCallback', {
       functionName: `video-processor-${stage}-highlights-callback`,
@@ -118,23 +121,32 @@ export class Lambdas extends Construct {
       entry: path.join(__dirname, '../../lambda/highlights/index.ts'),
       handler: 'callback',
       timeout: cdk.Duration.seconds(10),
+      environment: { TABLE_NAME: jobsTable.tableName },
     });
 
     this.highlightsCallback.addToRolePolicy(new iam.PolicyStatement({
       actions: ['states:SendTaskSuccess', 'states:SendTaskFailure'],
       resources: ['*'],
     }));
+    jobsTable.grantReadData(this.highlightsCallback);
 
-    // ── Twelvelabs ──────────────────────────────────────────────────────────────
+    // ── Twelvelabs ───────────────────────────────────────────────────────────────
 
     this.twelvelabs = new nodejs.NodejsFunction(this, 'Twelvelabs', {
       functionName: `video-processor-${stage}-twelvelabs`,
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(__dirname, '../../lambda/twelvelabs/index.ts'),
       handler: 'handler',
-      timeout: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.seconds(900),
+      environment: {
+        ACCOUNT_ID: cdk.Stack.of(scope).account,
+      },
     });
 
-    outputBucket.grantRead(this.twelvelabs);
+    this.twelvelabs.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['bedrock:InvokeModel'],
+      resources: ['*'],
+    }));
+    bucket.grantRead(this.twelvelabs);
   }
 }

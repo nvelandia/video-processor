@@ -19,16 +19,16 @@ export class VideoProcessorStack extends cdk.Stack {
     // ── MediaConvert IAM Role ────────────────────────────────────────────────────
     const mediaConvertRole = new MediaConvertRole(this, 'MediaConvertRole', {
       stage,
-      inputBucket: storage.inputBucket,
-      outputBucket: storage.outputBucket,
+      bucket: storage.bucket,
     });
 
     // ── Step Function (necesita Lambdas; se crea en dos pasos) ───────────────────
-    // Lambdas que el Step Function invoca directamente (sin stateMachineArn aún)
+    const bedrockModelId = process.env.BEDROCK_MODEL_ID;
+    if (!bedrockModelId) throw new Error('BEDROCK_MODEL_ID is required in .env');
+
     const preStateLambdas: Lambdas = new Lambdas(this, 'Lambdas', {
       stage,
-      inputBucket: storage.inputBucket,
-      outputBucket: storage.outputBucket,
+      bucket: storage.bucket,
       jobsTable: storage.jobsTable,
       mediaConvertRoleArn: mediaConvertRole.role.roleArn,
       mediaConvertEndpoint: `https://mediaconvert.${this.region}.amazonaws.com`,
@@ -41,6 +41,7 @@ export class VideoProcessorStack extends cdk.Stack {
       qualitiesLaunchFn: preStateLambdas.qualitiesLaunch,
       highlightsLaunchFn: preStateLambdas.highlightsLaunch,
       twelvelabsFn: preStateLambdas.twelvelabs,
+      bedrockModelId,
     });
 
     // ── EventBridge Rules ────────────────────────────────────────────────────────
@@ -50,11 +51,11 @@ export class VideoProcessorStack extends cdk.Stack {
       highlightsCallbackFn: preStateLambdas.highlightsCallback,
     });
 
-    // ── S3 trigger → orchestrator ────────────────────────────────────────────────
-    storage.inputBucket.addEventNotification(
+    // ── S3 trigger → orchestrator (solo archivos en input/) ───────────────────────
+    storage.bucket.addEventNotification(
       cdk.aws_s3.EventType.OBJECT_CREATED,
       new s3n.LambdaDestination(preStateLambdas.orchestrator),
-      { suffix: '.mp4' },
+      { prefix: 'input/', suffix: '.mp4' },
     );
   }
 }

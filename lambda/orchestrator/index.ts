@@ -8,13 +8,14 @@ const sfnClient = new SFNClient({});
 
 export const handler = async (event: any): Promise<void> => {
   const record = event.Records[0];
-  const inputBucket = record.s3.bucket.name;
+  const bucketName = record.s3.bucket.name;
   const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
 
-  const jobId = randomUUID();
-  const outputBucket = process.env.OUTPUT_BUCKET as string;
-  const outputVideo = `s3://${outputBucket}/${jobId}/`;
-  const inputKey = `s3://${inputBucket}/${key}`;
+  const filename = key.split('/').pop()!.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '-');
+  const jobId = `${filename}-${randomUUID()}`;
+  const bucket = process.env.BUCKET as string;
+  const inputKey = `s3://${bucketName}/${key}`;
+  const outputVideo = `s3://${bucket}/output/${jobId}/`;
   const createdAt = new Date().toISOString();
   const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7; // 7 días
 
@@ -34,8 +35,8 @@ export const handler = async (event: any): Promise<void> => {
   await sfnClient.send(new StartExecutionCommand({
     stateMachineArn: process.env.STATE_MACHINE_ARN as string,
     name: jobId,
-    input: JSON.stringify({ jobId, inputKey, outputVideo, outputBucket }),
+    input: JSON.stringify({ jobId, inputKey, outputVideo }),
   }));
 
-  console.log(`Job iniciado: jobId=${jobId}, inputKey=${inputKey}`);
+  console.log(`Job iniciado: jobId=${jobId}, inputKey=${inputKey}, outputVideo=${outputVideo}`);
 };

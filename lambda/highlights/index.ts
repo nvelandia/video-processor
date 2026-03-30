@@ -1,8 +1,11 @@
 import { MediaConvertClient, CreateJobCommand } from '@aws-sdk/client-mediaconvert';
 import { SFNClient, SendTaskSuccessCommand, SendTaskFailureCommand } from '@aws-sdk/client-sfn';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 
 const mediaConvert = new MediaConvertClient({ endpoint: process.env.MEDIACONVERT_ENDPOINT });
 const sfnClient = new SFNClient({});
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 interface InputClipping {
   StartTimecode: string;
@@ -18,6 +21,14 @@ export const launch = async (event: {
   timestamps: InputClipping[];
 }): Promise<void> => {
   const { taskToken, jobId, inputKey, outputVideo, timestamps } = event;
+
+  // Guardar taskToken en DynamoDB (UserMetadata de MediaConvert tiene límite de 256 chars)
+  await ddb.send(new UpdateCommand({
+    TableName: process.env.TABLE_NAME,
+    Key: { jobId },
+    UpdateExpression: 'SET highlightsTaskToken = :t',
+    ExpressionAttributeValues: { ':t': taskToken },
+  }));
 
   await mediaConvert.send(new CreateJobCommand({
     Role: process.env.MEDIACONVERT_ROLE_ARN,
@@ -57,7 +68,7 @@ export const launch = async (event: {
         }],
       }],
     },
-    UserMetadata: { taskToken, branch: 'highlights', jobId },
+    UserMetadata: { branch: 'highlights', jobId },
   } as any));
 
   console.log(`MediaConvert highlights job creado para jobId=${jobId}`);
@@ -67,10 +78,23 @@ export const launch = async (event: {
 export const callback = async (event: any): Promise<void> => {
   const detail = event.detail;
   const status: string = detail.status;
-  const taskToken: string | undefined = detail.userMetadata?.taskToken;
+  const jobId: string | undefined = detail.userMetadata?.jobId;
+
+  if (!jobId) {
+    console.error('No jobId en userMetadata', JSON.stringify(detail));
+    return;
+  }
+
+  const result = await ddb.send(new GetCommand({
+    TableName: process.env.TABLE_NAME,
+    Key: { jobId },
+    ProjectionExpression: 'highlightsTaskToken',
+  }));
+
+  const taskToken: string | undefined = result.Item?.highlightsTaskToken;
 
   if (!taskToken) {
-    console.error('No taskToken en userMetadata', JSON.stringify(detail));
+    console.error(`No highlightsTaskToken en DynamoDB para jobId=${jobId}`);
     return;
   }
 

@@ -4,8 +4,7 @@ import { Construct } from 'constructs';
 
 export interface MediaConvertRoleProps {
   stage: string;
-  inputBucket: s3.IBucket;
-  outputBucket: s3.IBucket;
+  bucket: s3.IBucket;
 }
 
 export class MediaConvertRole extends Construct {
@@ -14,14 +13,13 @@ export class MediaConvertRole extends Construct {
   constructor(scope: Construct, id: string, props: MediaConvertRoleProps) {
     super(scope, id);
 
-    const { stage, inputBucket, outputBucket } = props;
+    const { stage, bucket } = props;
 
     this.role = new iam.Role(this, 'Role', {
       roleName: `video-processor-${stage}-mediaconvert`,
       assumedBy: new iam.ServicePrincipal('mediaconvert.amazonaws.com'),
     });
 
-    inputBucket.grantRead(this.role);
-    outputBucket.grantReadWrite(this.role);
+    bucket.grantReadWrite(this.role);
   }
 }

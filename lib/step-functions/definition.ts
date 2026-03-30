@@ -9,10 +9,11 @@ export interface DefinitionProps {
   qualitiesLaunchFn: lambda.IFunction;
   highlightsLaunchFn: lambda.IFunction;
   twelvelabsFn: lambda.IFunction;
+  bedrockModelId: string;
 }
 
 export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.IChainable {
-  const { jobsTable, qualitiesLaunchFn, highlightsLaunchFn, twelvelabsFn } = props;
+  const { jobsTable, qualitiesLaunchFn, highlightsLaunchFn, twelvelabsFn, bedrockModelId } = props;
 
   // ── RegisterStart ─────────────────────────────────────────────────────────────
 
@@ -65,48 +66,13 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
 
   // ── Branch B — Análisis + Highlight reel ─────────────────────────────────────
 
-  const invokePegasus = new sfn.CustomState(scope, 'InvokePegasus', {
-    stateJson: {
-      Type: 'Task',
-      Resource: 'arn:aws:states:::bedrock-runtime:startAsyncInvoke.sync:2',
-      Parameters: {
-        ModelId: 'twelvelabs.pegasus-1-2-v1:0',
-        ModelInput: {
-          mediaSource: {
-            s3Location: { 'uri.$': '$.inputKey' },
-          },
-          inputPrompt: 'Identify all key moments (goals, cards, near misses) in this soccer match. Return a JSON array where each element has: start (MM:SS), end (MM:SS), label (string).',
-        },
-        OutputDataConfig: {
-          s3OutputDataConfig: {
-            's3Uri.$': "States.Format('{}tmp/', $.outputVideo)",
-          },
-        },
-      },
-      ResultPath: '$.pegasusInvocation',
-    },
-  });
-
-  const parsePegasusOutput = new tasks.LambdaInvoke(scope, 'ParsePegasusOutput', {
-    lambdaFunction: twelvelabsFn,
-    payload: sfn.TaskInput.fromObject({
-      'jobId.$':        '$.jobId',
-      'outputBucket.$': '$.outputBucket',
-    }),
-    resultSelector: { 'timestamps.$': '$.Payload.timestamps' },
-    resultPath: '$.parsed',
-  });
-
   const updateHighlightsFailed = new tasks.DynamoUpdateItem(scope, 'UpdateHighlightsFailed', {
     table: jobsTable,
     key: { jobId: tasks.DynamoAttributeValue.fromString(sfn.JsonPath.stringAt('$.jobId')) },
     updateExpression: 'SET highlightsStatus = :s',
     expressionAttributeValues: { ':s': tasks.DynamoAttributeValue.fromString('FAILED') },
     resultPath: sfn.JsonPath.DISCARD,
-  }).next(new sfn.Fail(scope, 'NoTimestamps', {
-    error: 'EmptyTimestamps',
-    cause: 'Pegasus no devolvió momentos clave',
-  }));
+  }).next(new sfn.Succeed(scope, 'NoTimestamps'));
 
   const updateHighlightsToProcessing = new tasks.DynamoUpdateItem(scope, 'UpdateHighlightsStatus', {
     table: jobsTable,
@@ -124,7 +90,7 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
       'jobId.$':       '$.jobId',
       'inputKey.$':    '$.inputKey',
       'outputVideo.$': '$.outputVideo',
-      'timestamps.$':  '$.parsed.timestamps',
+      'timestamps.$':  '$.pegasus.timestamps',
     }),
     resultPath: sfn.JsonPath.DISCARD,
   });
@@ -149,22 +115,36 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
 
   const checkTimestamps = new sfn.Choice(scope, 'CheckTimestamps')
     .when(
-      sfn.Condition.isPresent('$.parsed.timestamps[0]'),
+      sfn.Condition.isPresent('$.pegasus.timestamps[0]'),
       sfn.Chain.start(updateHighlightsToProcessing)
         .next(launchHighlights)
         .next(updateHighlightsDone),
     )
     .otherwise(updateHighlightsFailed);
 
-  const branchB = sfn.Chain.start(invokePegasus)
-    .next(parsePegasusOutput)
-    .next(checkTimestamps);
+  // ── Pegasus polling loop ──────────────────────────────────────────────────────
+
+  const invokePegasus = new tasks.LambdaInvoke(scope, 'InvokePegasus', {
+    lambdaFunction: twelvelabsFn,
+    payload: sfn.TaskInput.fromObject({
+      'jobId.$':        '$.jobId',
+      'inputKey.$':     '$.inputKey',
+      'bedrockModelId': bedrockModelId,
+    }),
+    resultSelector: { 'timestamps.$': '$.Payload.timestamps' },
+    resultPath: '$.pegasus',
+  });
+
+  const branchB = sfn.Chain.start(invokePegasus).next(checkTimestamps);
 
   // ── Parallel ──────────────────────────────────────────────────────────────────
 
   const parallel = new sfn.Parallel(scope, 'ParallelProcess');
   parallel.branch(branchA);
   parallel.branch(branchB);
+
+  // Suppress unused variable warning
+  void bedrockModelId;
 
   return sfn.Chain.start(registerStart).next(parallel);
 }
