@@ -6,6 +6,7 @@ import { MediaConvertRole } from '../constructs/mediaconvert-role';
 import { StateMachineConstruct } from '../constructs/state-machine';
 import { Lambdas } from '../constructs/lambdas';
 import { EventBridgeRules } from '../constructs/eventbridge-rules';
+import { FargatePegasus } from '../constructs/fargate-pegasus';
 
 export class VideoProcessorStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -22,10 +23,16 @@ export class VideoProcessorStack extends cdk.Stack {
       bucket: storage.bucket,
     });
 
-    // ── Step Function (necesita Lambdas; se crea en dos pasos) ───────────────────
+    // ── Fargate — Pegasus (Bedrock invocation) ───────────────────────────────────
     const bedrockModelId = process.env.BEDROCK_MODEL_ID;
     if (!bedrockModelId) throw new Error('BEDROCK_MODEL_ID is required in .env');
 
+    const fargatePegasus = new FargatePegasus(this, 'FargatePegasus', {
+      stage,
+      inputBucket: storage.bucket,
+    });
+
+    // ── Step Function (necesita Lambdas; se crea en dos pasos) ───────────────────
     const preStateLambdas: Lambdas = new Lambdas(this, 'Lambdas', {
       stage,
       bucket: storage.bucket,
@@ -40,7 +47,10 @@ export class VideoProcessorStack extends cdk.Stack {
       jobsTable: storage.jobsTable,
       qualitiesLaunchFn: preStateLambdas.qualitiesLaunch,
       highlightsLaunchFn: preStateLambdas.highlightsLaunch,
-      twelvelabsFn: preStateLambdas.twelvelabs,
+      pegasusCluster: fargatePegasus.cluster,
+      pegasusTaskDef: fargatePegasus.taskDefinition,
+      pegasusContainer: fargatePegasus.container,
+      pegasusSecurityGroup: fargatePegasus.securityGroup,
       bedrockModelId,
     });
 

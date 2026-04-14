@@ -1,47 +1,63 @@
 # Video Processor Project
 
-## Arquitectura
-Toda la infraestructura se despliega mediante AWS CDK con Nodejs y TypeScript.
-
 ## Resumen
 
-Pipeline serverless en AWS CDK que recibe un video crudo en S3, lo procesa en dos branches paralelos mediante Step Functions, y produce dos outputs independientes: calidades de video en HLS y un highlight reel. El análisis de momentos clave se realiza con **Amazon Bedrock — modelo `twelvelabs.pegasus-1-2-v1:0`** en modo asíncrono. No se guardan clips intermedios — el highlight reel se genera en un único job de MediaConvert con múltiples `InputClippings`.
+Pipeline serverless en AWS CDK (Node.js + TypeScript) que recibe un video crudo en S3, lo procesa en dos branches paralelos mediante Step Functions, y produce dos outputs independientes: calidades de video en HLS y un highlight reel. El análisis de momentos clave se realiza con **Amazon Bedrock — modelo `twelvelabs.pegasus-1-2-v1:0`** invocado sincrónicamente desde un **contenedor Fargate**. No se guardan clips intermedios — el highlight reel se genera en un único job de MediaConvert con múltiples `InputClippings`.
 
 ---
 
-## Arquitectura general
+## Infraestructura general
+
+### S3 — bucket único
+
+Un solo bucket: `video-processor-{stage}-media`
+
+```
+s3://video-processor-{stage}-media/
+├── input/          ← videos crudos subidos por el usuario (.mp4)
+└── output/{jobId}/
+    ├── qualities/  ← HLS multi-resolución (5 calidades)
+    └── highlights/ ← highlight reel 720p
+```
+
+El trigger de S3 filtra por `prefix: input/` y `suffix: .mp4`.
 
 ### Flujo de entrada
 
-1. El usuario sube un `.mp4` al **S3 Input Bucket**
-2. El evento `s3:ObjectCreated` dispara la **Lambda orquestadora**
-3. La Lambda genera un `jobId` (UUID), crea el item en DynamoDB, y llama a `StartExecution` en la Step Function
+1. El usuario sube un `.mp4` a `input/` del bucket
+2. `s3:ObjectCreated` dispara la **Lambda orquestadora**
+3. La Lambda genera un `jobId` = `{filename}-{UUIDv4}`, crea el item en DynamoDB, e inicia la Step Function
 
-### Step Function — estructura general
+---
+
+## Step Function — estructura general
 
 ```
-RegisterStart
+RegisterStart (DynamoPutItem)
 └── ParallelProcess (Parallel state)
     ├── Branch A — calidades de video
-    └── Branch B — análisis + highlight reel
+    └── Branch B — análisis Pegasus + highlight reel
 ```
 
-El Parallel state cierra cuando **ambos branches** terminan. Los branches son completamente independientes entre sí — si uno falla, el otro continúa.
+Los branches son independientes; si uno falla, el otro continúa. El Parallel state cierra cuando ambos terminan. Timeout total: **2 horas**.
 
 ---
 
 ## Branch A — Calidades de video
 
-### Responsabilidad
-Transcodear el video original a múltiples calidades en formato HLS.
-
 ### Pasos
-1. Lanzar job de **MediaConvert** con `waitForTaskToken`
-   - Input: `inputKey` del evento de entrada
-   - Output: `{outputVideo}qualities/` en S3 Output
-   - Formato: HLS adaptive bitrate (múltiples calidades + master playlist)
-2. MediaConvert termina → EventBridge emite evento → **Lambda callback A** llama a `SendTaskSuccess`
-3. Actualizar DynamoDB: `qualitiesStatus → DONE` (o `FAILED`)
+
+1. **LaunchMediaConvertQualities** (`LambdaInvoke` con `WAIT_FOR_TASK_TOKEN`)
+   - Llama a `lambda/qualities/index.ts → launch`
+   - El `taskToken` se guarda en DynamoDB (`qualitiesTaskToken`) porque `UserMetadata` de MediaConvert tiene límite de 256 caracteres
+   - MediaConvert transcode a 5 resoluciones HLS: 1080p, 720p, 480p, 360p, 240p
+   - Output: `output/{jobId}/qualities/`
+   - `UserMetadata`: `{ branch: "qualities", jobId }`
+2. MediaConvert termina → EventBridge → **Lambda QualitiesCallback** (`lambda/qualities/index.ts → callback`)
+   - Lee `qualitiesTaskToken` desde DynamoDB → llama a `SendTaskSuccess` o `SendTaskFailure`
+3. **UpdateQualitiesDone** (DynamoUpdateItem: `qualitiesStatus = DONE`)
+
+En caso de error en MediaConvert: **UpdateQualitiesFailed** (`qualitiesStatus = FAILED`) + el branch termina exitosamente desde la perspectiva del Parallel.
 
 ### Estados de `qualitiesStatus`
 ```
@@ -50,182 +66,158 @@ PENDING → DONE | FAILED
 
 ---
 
-## Branch B — Análisis + Highlight reel
+## Branch B — Análisis Pegasus + Highlight reel
 
-### Responsabilidad
-Analizar el video con Bedrock/Pegasus para obtener timestamps de momentos clave, luego generar un único highlight reel `.m3u8` con MediaConvert usando esos timestamps como `InputClippings`. No se guardan clips intermedios.
+### Pasos
 
-### Pasos en orden secuencial
+#### B1 — InvokePegasus (`EcsRunTask` con `WAIT_FOR_TASK_TOKEN`)
+- Step Functions lanza una tarea **Fargate** en `fargate/pegasus/`
+- Variables de entorno inyectadas: `TASK_TOKEN`, `JOB_ID`, `INPUT_KEY`, `BEDROCK_MODEL_ID`
+- El container llama sincrónicamente a Bedrock `InvokeModel` con el modelo `BEDROCK_MODEL_ID`
+- Prompt: detectar todos los goles del partido y devolver array de timestamps
+- Al terminar, el container llama a `SendTaskSuccess` con `{ timestamps: [...] }` (o `SendTaskFailure` si falla)
+- Resultado disponible en `$.pegasus.timestamps`
 
-#### Paso B1 — Bedrock `StartAsyncInvoke`
-- Actualizar DynamoDB: `highlightsStatus → PEGASUS`
-- Step Functions invoca **Bedrock** con SDK integration (`aws:bedrock:startAsyncInvoke`)
-  - Modelo: `twelvelabs.pegasus-1-2-v1:0`
-  - Input: referencia al video en S3 (`inputKey`)
-  - Output: Bedrock escribe el resultado JSON en S3 (bucket temporal o mismo output bucket bajo `{outputVideo}tmp/`)
-- Step Functions espera la finalización via `waitForTaskToken` + Lambda de polling, o polling nativo si el SDK integration lo soporta
-- Cuando Bedrock termina, el estado recibe el array de timestamps
-
-Formato esperado del output de Bedrock/Pegasus:
+Formato de timestamps esperado de Bedrock/Pegasus:
 ```json
 [
   { "start": "00:32", "end": "00:45", "label": "gol" },
   { "start": "01:10", "end": "01:28", "label": "gol" }
 ]
 ```
+Convertido internamente a formato MediaConvert `InputClipping`: `{ StartTimecode: "00:MM:SS:00", EndTimecode: "00:MM:SS:00" }`.
 
-#### Paso B2 — Validar timestamps (`Choice`)
-- Si el array está vacío → `highlightsStatus → FAILED` con mensaje descriptivo
-- Si tiene al menos un elemento → continuar al paso B3
+#### B2 — CheckTimestamps (Choice)
+- Condición: `sfn.Condition.isPresent('$.pegasus.timestamps[0]')`
+  - Array con al menos un elemento → continuar a B3
+  - Array vacío → **UpdateHighlightsFailed** + `Succeed` (branch termina sin propagar error)
 
-#### Paso B3 — MediaConvert highlight reel (job único)
-- Actualizar DynamoDB: `highlightsStatus → HIGHLIGHTS`
-- Lanzar **un único job de MediaConvert** con `waitForTaskToken`
-  - Todos los timestamps del paso anterior se pasan como `InputClippings` en secuencia dentro de un mismo job
-  - MediaConvert ensambla los segmentos en orden y produce un único archivo
-  - Output: `{outputVideo}highlights/highlight.m3u8`
-  - No se generan ni guardan clips intermedios
-  - `UserMetadata.taskToken` = token de Step Functions
-  - `UserMetadata.branch` = `"highlights"`
-- MediaConvert termina → EventBridge → **Lambda callback B** → `SendTaskSuccess`
-- Actualizar DynamoDB: `highlightsStatus → DONE` (o `FAILED`)
+#### B3 — UpdateHighlightsStatus + LaunchMediaConvertHighlight
+- **UpdateHighlightsStatus**: `highlightsStatus = HIGHLIGHTS`
+- **LaunchMediaConvertHighlight** (`LambdaInvoke` con `WAIT_FOR_TASK_TOKEN`)
+  - Llama a `lambda/highlights/index.ts → launch`
+  - El `taskToken` se guarda en DynamoDB (`highlightsTaskToken`)
+  - MediaConvert genera highlight reel HLS en **720p** con todos los `InputClippings` en secuencia
+  - Output: `output/{jobId}/highlights/`
+  - `UserMetadata`: `{ branch: "highlights", jobId }`
+- MediaConvert termina → EventBridge → **Lambda HighlightsCallback** (`lambda/highlights/index.ts → callback`)
+  - Lee `highlightsTaskToken` desde DynamoDB → llama a `SendTaskSuccess` o `SendTaskFailure`
+- **UpdateHighlightsDone**: `highlightsStatus = DONE`
+
+En caso de error en MediaConvert highlights: **UpdateHighlightsFailedOnMediaConvert** (`highlightsStatus = FAILED`).
 
 ### Estados de `highlightsStatus`
 ```
 PEGASUS → HIGHLIGHTS → DONE | FAILED
 ```
-`FAILED` puede ocurrir en cualquier transición y corta el branch.
+`FAILED` puede ocurrir en cualquier transición.
 
 ---
 
-## DynamoDB — Tabla `jobs`
+## DynamoDB — Tabla `video-processor-{stage}-jobs`
 
 | Campo | Tipo | Descripción |
 |---|---|---|
-| `jobId` | String (PK) | UUID generado por la Lambda orquestadora |
+| `jobId` | String (PK) | `{filename}-{UUIDv4}` |
 | `qualitiesStatus` | String | `PENDING` → `DONE` \| `FAILED` |
 | `highlightsStatus` | String | `PEGASUS` → `HIGHLIGHTS` → `DONE` \| `FAILED` |
-| `outputVideo` | String | Prefijo S3 base: `s3://output-bucket/jobId/` |
-| `inputKey` | String | `s3://input-bucket/filename.mp4` |
-| `createdAt` | String | ISO timestamp — usado para TTL |
+| `outputVideo` | String | `s3://{bucket}/output/{jobId}/` |
+| `inputKey` | String | `s3://{bucket}/input/{filename}.mp4` |
+| `createdAt` | String | ISO timestamp (referencia) |
+| `ttl` | Number | Unix timestamp = `now + 7 días` — atributo TTL de DynamoDB |
+| `qualitiesTaskToken` | String | Task token de Step Functions para callback de qualities |
+| `highlightsTaskToken` | String | Task token de Step Functions para callback de highlights |
 
 ### Notas
-- Los timestamps de Pegasus **no se persisten** en DynamoDB — viven solo en la memoria de la ejecución de Step Functions
-- Cada branch escribe únicamente sus propios campos con `UpdateItem` — sin riesgo de colisión
-- TTL configurado sobre `createdAt` 
-
-### Estructura de outputs en S3
-
-```
-s3://output-bucket/{jobId}/
-├── qualities/
-│   ├── 1080p.m3u8
-│   ├── 720P.m3u8
-│   ├── 480p.m3u8
-│   ├── 360p.m3u8
-│   └── 240p.m3u8
-|
-└── highlights/
-    └── highlight.m3u8
-```
+- Los task tokens se guardan en DynamoDB porque `UserMetadata` de MediaConvert tiene límite de 256 caracteres
+- Los timestamps de Pegasus **no se persisten** — viven solo en la ejecución de Step Functions
+- Billing mode: `PAY_PER_REQUEST`
 
 ---
 
-## Servicios AWS involucrados
+## Fargate Pegasus
+
+- **VPC**: propia, 2 AZs, subnets públicas, sin NAT gateways
+- **Security Group**: permite todo el tráfico saliente (`allowAllOutbound: true`)
+- **Tarea Fargate**: 256 CPU / 512 MB RAM, `assignPublicIp: true`
+- **Image**: construida desde `fargate/pegasus/` (Dockerfile local)
+- **Permisos del task role**: `bedrock:InvokeModel`, `states:SendTaskSuccess`, `states:SendTaskFailure`, `s3:GetObject` en el bucket
+- `BEDROCK_MODEL_ID` debe configurarse como variable de entorno en el host antes del deploy (`process.env.BEDROCK_MODEL_ID` leído en `bin/video-processor.ts`)
+
+---
+
+## Lambdas
+
+### Orchestrator — `lambda/orchestrator/index.ts`
+- **Trigger**: S3 `ObjectCreated` en `input/*.mp4`
+- Genera `jobId = {filename}-{UUIDv4}`, escribe item en DynamoDB, inicia Step Function
+- Runtime: Node.js 20.x, timeout: 15 s
+- **Permisos**: `dynamodb:PutItem`, `states:StartExecution`, `s3:PutObject`
+
+### QualitiesLaunch — `lambda/qualities/index.ts → launch`
+- Llamado por Step Functions (`WAIT_FOR_TASK_TOKEN`)
+- Guarda `qualitiesTaskToken` en DynamoDB, lanza job de MediaConvert con 5 resoluciones HLS
+- Runtime: Node.js 20.x, timeout: 30 s
+- **Permisos**: `mediaconvert:CreateJob`, `iam:PassRole`, `s3:GetObject`, `dynamodb:UpdateItem`
+
+### QualitiesCallback — `lambda/qualities/index.ts → callback`
+- **Trigger**: EventBridge — `MediaConvert Job State Change` donde `userMetadata.branch = "qualities"`; estados: `COMPLETE`, `ERROR`, `CANCELED`
+- Lee `qualitiesTaskToken` de DynamoDB → `SendTaskSuccess` o `SendTaskFailure`
+- Runtime: Node.js 20.x, timeout: 10 s
+- **Permisos**: `states:SendTaskSuccess`, `states:SendTaskFailure`, `dynamodb:GetItem`
+
+### HighlightsLaunch — `lambda/highlights/index.ts → launch`
+- Llamado por Step Functions (`WAIT_FOR_TASK_TOKEN`)
+- Guarda `highlightsTaskToken` en DynamoDB, lanza job de MediaConvert con `InputClippings` (timestamps de Pegasus), output 720p
+- Runtime: Node.js 20.x, timeout: 30 s
+- **Permisos**: `mediaconvert:CreateJob`, `iam:PassRole`, `s3:GetObject`, `dynamodb:UpdateItem`
+
+### HighlightsCallback — `lambda/highlights/index.ts → callback`
+- **Trigger**: EventBridge — `MediaConvert Job State Change` donde `userMetadata.branch = "highlights"`; estados: `COMPLETE`, `ERROR`, `CANCELED`
+- Lee `highlightsTaskToken` de DynamoDB → `SendTaskSuccess` o `SendTaskFailure`
+- Runtime: Node.js 20.x, timeout: 10 s
+- **Permisos**: `states:SendTaskSuccess`, `states:SendTaskFailure`, `dynamodb:GetItem`
+
+> **Nota**: `lambda/twelvelabs/index.ts` existe en el repositorio pero **no está conectado** a ningún construct CDK. Es código vestigial de una iteración anterior.
+
+---
+
+## IAM — roles
+
+### MediaConvert Role
+- Trust policy: `mediaconvert.amazonaws.com`
+- `s3:GetObject` y `s3:PutObject` en el bucket
+
+### Step Functions Role (generado automáticamente por CDK)
+- `lambda:InvokeFunction` sobre QualitiesLaunch y HighlightsLaunch
+- `ecs:RunTask`, `ecs:StopTask`, `ecs:DescribeTasks`
+- `iam:PassRole` sobre el task role y execution role de Fargate
+- `dynamodb:PutItem`, `dynamodb:UpdateItem` sobre la tabla jobs
+
+### Fargate Task Role
+- `bedrock:InvokeModel`
+- `states:SendTaskSuccess`, `states:SendTaskFailure`
+- `s3:GetObject` en el bucket
+
+---
+
+## Servicios AWS
 
 | Servicio | Rol |
 |---|---|
-| S3 (input) | Recibe el video crudo del usuario |
-| S3 (output) | Almacena calidades HLS y highlight reel |
-| Lambda (orquestadora) | Disparada por S3, crea item en DynamoDB, inicia Step Function |
-| Step Functions | Orquesta el pipeline completo |
-| DynamoDB | Registro de estado del job |
-| Bedrock (`twelvelabs.pegasus-1-2-v1:0`) | Análisis del video en modo asíncrono, devuelve timestamps |
-| MediaConvert | Transcodeo HLS (branch A) + highlight reel con InputClippings (branch B) |
-| EventBridge | Recibe eventos de fin de job de MediaConvert |
-| Lambda (callback A) | MediaConvert qualities → `SendTaskSuccess` |
-| Lambda (callback B) | MediaConvert highlight → `SendTaskSuccess` |
-| IAM | Roles para MediaConvert, Step Functions, Lambdas, Bedrock |
-
+| S3 (bucket único) | Input `input/` y output `output/{jobId}/` |
+| Lambda (orchestrator) | Trigger S3 → crea DynamoDB item + inicia Step Function |
+| Step Functions | Orquesta el pipeline completo (timeout 2 h) |
+| DynamoDB | Estado del job + task tokens de MediaConvert |
+| ECS Fargate | Corre el container Pegasus que invoca Bedrock |
+| Bedrock (`twelvelabs.pegasus-1-2-v1:0`) | Análisis de video, devuelve timestamps de goles |
+| MediaConvert | HLS multi-resolución (Branch A) + highlight reel 720p (Branch B) |
+| EventBridge | Recibe fin de jobs MediaConvert → dispara Lambda callbacks |
+| Lambda (callbacks) | `SendTaskSuccess`/`SendTaskFailure` a Step Functions |
 
 ---
 
-## Lambdas — detalle
-
-### Lambda orquestadora
-- **Trigger**: `s3:ObjectCreated` en input bucket
-- **Acciones**:
-  1. Genera `jobId` (UUID v4)
-  2. Construye `outputVideo` = `s3://output-bucket/{jobId}/`
-  3. Escribe item inicial en DynamoDB (`qualitiesStatus: PENDING`, `highlightsStatus: PEGASUS`)
-  4. Llama a `StepFunctions.startExecution` con `{ jobId, inputKey, outputVideo }`
-- **Permisos**: `dynamodb:PutItem`, `states:StartExecution`, `s3:GetObject` en input bucket
-
-### Lambda callback A — MediaConvert qualities
-- **Trigger**: EventBridge rule — `MediaConvert Job State Change`, filtrado por `UserMetadata.branch = "qualities"`
-- **Acciones**: extrae `taskToken` de `UserMetadata` → `SendTaskSuccess` o `SendTaskFailure`
-- **Permisos**: `states:SendTaskSuccess`, `states:SendTaskFailure`
-
-### Lambda callback B — MediaConvert highlight
-- **Trigger**: EventBridge rule — `MediaConvert Job State Change`, filtrado por `UserMetadata.branch = "highlights"`
-- **Acciones**: extrae `taskToken` de `UserMetadata` → `SendTaskSuccess` o `SendTaskFailure`
-- **Permisos**: `states:SendTaskSuccess`, `states:SendTaskFailure`
-
----
-
-## Step Functions — definición de estados
-
-```
-RegisterStart (Task)
-  → PutItem DynamoDB: qualitiesStatus=PENDING, highlightsStatus=PEGASUS
-
-ParallelProcess (Parallel)
-  │
-  ├── BranchA
-  │   ├── LaunchMediaConvertQualities (Task — waitForTaskToken)
-  │   │     UserMetadata: { taskToken: $$.Task.Token, branch: "qualities" }
-  │   │     Output: {outputVideo}qualities/
-  │   └── UpdateQualitiesDone (Task — UpdateItem DynamoDB: qualitiesStatus=DONE)
-  │
-  └── BranchB
-      ├── InvokePegasus (Task — Bedrock StartAsyncInvoke)
-      │     modelo: twelvelabs.pegasus-1-2-v1:0
-      │     input: { s3Uri: $.inputKey }
-      │     outputLocation: {outputVideo}tmp/pegasus-result.json
-      ├── CheckTimestamps (Choice)
-      │     $.timestamps.length == 0 → UpdateHighlightsFailed
-      │     $.timestamps.length > 0  → UpdateHighlightsStatus
-      ├── UpdateHighlightsStatus (Task — UpdateItem DynamoDB: highlightsStatus=HIGHLIGHTS)
-      ├── LaunchMediaConvertHighlight (Task — waitForTaskToken)
-      │     InputClippings: todos los timestamps en secuencia (sin archivos intermedios)
-      │     Output: {outputVideo}highlights/highlight.m3u8
-      │     UserMetadata: { taskToken: $$.Task.Token, branch: "highlights" }
-      └── UpdateHighlightsDone (Task — UpdateItem DynamoDB: highlightsStatus=DONE)
-```
-
----
-
-## IAM — roles necesarios
-
-### Rol MediaConvert
-- Trust policy: `mediaconvert.amazonaws.com`
-- `s3:GetObject` en input bucket
-- `s3:PutObject` en output bucket
-
-### Rol Step Functions
-- Trust policy: `states.amazonaws.com`
-- `lambda:InvokeFunction` sobre Lambdas internas
-- `bedrock:InvokeModel`, `bedrock:StartAsyncInvoke`
-- `mediaconvert:CreateJob`
-- `s3:GetObject`, `s3:PutObject` en output bucket
-
-### Rol Lambdas (todas)
-- `logs:CreateLogGroup`, `logs:CreateLogDelivery`, `logs:PutLogEvents`
-- Permisos específicos por Lambda detallados arriba
-
----
-
-## Estructura del repositorio CDK
+## Estructura del repositorio
 
 ```
 video-processor/
@@ -235,20 +227,33 @@ video-processor/
 │   ├── stacks/
 │   │   └── video-processor-stack.ts
 │   ├── constructs/
-│   │   ├── storage.ts               # S3 buckets + DynamoDB
-│   │   ├── lambdas.ts               # orquestadora + callbacks A y B
+│   │   ├── storage.ts               # S3 bucket único + DynamoDB
+│   │   ├── lambdas.ts               # orchestrator + launch/callback qualities + launch/callback highlights
 │   │   ├── mediaconvert-role.ts     # IAM role de MediaConvert
-│   │   ├── state-machine.ts         # Step Function completa
-│   │   └── eventbridge-rules.ts     # reglas para callbacks de MediaConvert
+│   │   ├── state-machine.ts         # Step Function
+│   │   ├── eventbridge-rules.ts     # reglas MediaConvert → callbacks
+│   │   └── fargate-pegasus.ts       # VPC + Cluster + TaskDef + Container
 │   └── step-functions/
-│       └── definition.ts            # ASL de la Step Function
+│       └── definition.ts            # ASL de la Step Function (CDK)
 ├── lambda/
-│   ├── orchestrator/
-│   │   └── index.ts
-│   ├── callback-qualities/
-│   │   └── index.ts
-│   └── callback-highlights/
-│       └── index.ts
+│   ├── orchestrator/index.ts
+│   ├── qualities/index.ts           # handlers: launch, callback
+│   ├── highlights/index.ts          # handlers: launch, callback
+│   └── twelvelabs/index.ts          # ⚠ no conectado — código vestigial
+├── fargate/
+│   └── pegasus/
+│       └── src/index.ts             # container: invoca Bedrock + SendTaskSuccess
 ├── cdk.json
 └── package.json
+```
+
+---
+
+## Deploy
+
+Requiere la variable de entorno `BEDROCK_MODEL_ID` configurada antes de ejecutar `cdk deploy`.
+
+```bash
+export BEDROCK_MODEL_ID=twelvelabs.pegasus-1-2-v1:0
+cdk deploy --context stage=dev
 ```

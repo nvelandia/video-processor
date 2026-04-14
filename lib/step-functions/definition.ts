@@ -1,5 +1,7 @@
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
@@ -8,12 +10,24 @@ export interface DefinitionProps {
   jobsTable: dynamodb.ITable;
   qualitiesLaunchFn: lambda.IFunction;
   highlightsLaunchFn: lambda.IFunction;
-  twelvelabsFn: lambda.IFunction;
+  pegasusCluster: ecs.ICluster;
+  pegasusTaskDef: ecs.FargateTaskDefinition;
+  pegasusContainer: ecs.ContainerDefinition;
+  pegasusSecurityGroup: ec2.ISecurityGroup;
   bedrockModelId: string;
 }
 
 export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.IChainable {
-  const { jobsTable, qualitiesLaunchFn, highlightsLaunchFn, twelvelabsFn, bedrockModelId } = props;
+  const {
+    jobsTable,
+    qualitiesLaunchFn,
+    highlightsLaunchFn,
+    pegasusCluster,
+    pegasusTaskDef,
+    pegasusContainer,
+    pegasusSecurityGroup,
+    bedrockModelId,
+  } = props;
 
   // ── RegisterStart ─────────────────────────────────────────────────────────────
 
@@ -91,6 +105,7 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
       'inputKey.$':    '$.inputKey',
       'outputVideo.$': '$.outputVideo',
       'timestamps.$':  '$.pegasus.timestamps',
+      'goals.$':       '$.pegasus.goals',
     }),
     resultPath: sfn.JsonPath.DISCARD,
   });
@@ -122,18 +137,28 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
     )
     .otherwise(updateHighlightsFailed);
 
-  // ── Pegasus polling loop ──────────────────────────────────────────────────────
+  // ── Fargate — Pegasus ─────────────────────────────────────────────────────────
 
-  const invokePegasus = new tasks.LambdaInvoke(scope, 'InvokePegasus', {
-    lambdaFunction: twelvelabsFn,
-    payload: sfn.TaskInput.fromObject({
-      'jobId.$':        '$.jobId',
-      'inputKey.$':     '$.inputKey',
-      'bedrockModelId': bedrockModelId,
-    }),
-    resultSelector: { 'timestamps.$': '$.Payload.timestamps' },
+  const invokePegasus = new tasks.EcsRunTask(scope, 'InvokePegasus', {
+    integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+    cluster: pegasusCluster,
+    taskDefinition: pegasusTaskDef,
+    launchTarget: new tasks.EcsFargateLaunchTarget(),
+    assignPublicIp: true,
+    securityGroups: [pegasusSecurityGroup],
+    containerOverrides: [{
+      containerDefinition: pegasusContainer,
+      environment: [
+        { name: 'TASK_TOKEN', value: sfn.JsonPath.taskToken },
+        { name: 'JOB_ID', value: sfn.JsonPath.stringAt('$.jobId') },
+        { name: 'INPUT_KEY', value: sfn.JsonPath.stringAt('$.inputKey') },
+        { name: 'BEDROCK_MODEL_ID', value: bedrockModelId },
+      ],
+    }],
     resultPath: '$.pegasus',
   });
+
+  invokePegasus.addCatch(updateHighlightsFailed, { errors: ['States.ALL'], resultPath: '$.error' });
 
   const branchB = sfn.Chain.start(invokePegasus).next(checkTimestamps);
 
@@ -142,9 +167,6 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
   const parallel = new sfn.Parallel(scope, 'ParallelProcess');
   parallel.branch(branchA);
   parallel.branch(branchB);
-
-  // Suppress unused variable warning
-  void bedrockModelId;
 
   return sfn.Chain.start(registerStart).next(parallel);
 }

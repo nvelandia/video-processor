@@ -22,7 +22,6 @@ export class Lambdas extends Construct {
   readonly qualitiesCallback: nodejs.NodejsFunction;
   readonly highlightsLaunch: nodejs.NodejsFunction;
   readonly highlightsCallback: nodejs.NodejsFunction;
-  readonly twelvelabs: nodejs.NodejsFunction;
 
   constructor(scope: Construct, id: string, props: LambdasProps) {
     super(scope, id);
@@ -129,24 +128,5 @@ export class Lambdas extends Construct {
       resources: ['*'],
     }));
     jobsTable.grantReadData(this.highlightsCallback);
-
-    // ── Twelvelabs ───────────────────────────────────────────────────────────────
-
-    this.twelvelabs = new nodejs.NodejsFunction(this, 'Twelvelabs', {
-      functionName: `video-processor-${stage}-twelvelabs`,
-      runtime: lambda.Runtime.NODEJS_20_X,
-      entry: path.join(__dirname, '../../lambda/twelvelabs/index.ts'),
-      handler: 'handler',
-      timeout: cdk.Duration.seconds(900),
-      environment: {
-        ACCOUNT_ID: cdk.Stack.of(scope).account,
-      },
-    });
-
-    this.twelvelabs.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['bedrock:InvokeModel'],
-      resources: ['*'],
-    }));
-    bucket.grantRead(this.twelvelabs);
   }
 }

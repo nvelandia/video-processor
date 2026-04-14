@@ -12,6 +12,13 @@ interface InputClipping {
   EndTimecode: string;
 }
 
+interface Goal {
+  start: string;
+  goal_moment?: string;
+  end: string;
+  label: string;
+}
+
 // Llamado por Step Function con waitForTaskToken
 export const launch = async (event: {
   taskToken: string;
@@ -19,15 +26,19 @@ export const launch = async (event: {
   inputKey: string;
   outputVideo: string;
   timestamps: InputClipping[];
+  goals: Goal[];
 }): Promise<void> => {
-  const { taskToken, jobId, inputKey, outputVideo, timestamps } = event;
+  const { taskToken, jobId, inputKey, outputVideo, timestamps, goals } = event;
 
-  // Guardar taskToken en DynamoDB (UserMetadata de MediaConvert tiene límite de 256 chars)
+  // Guardar taskToken y goals en DynamoDB
   await ddb.send(new UpdateCommand({
     TableName: process.env.TABLE_NAME,
     Key: { jobId },
-    UpdateExpression: 'SET highlightsTaskToken = :t',
-    ExpressionAttributeValues: { ':t': taskToken },
+    UpdateExpression: 'SET highlightsTaskToken = :t, goals = :g',
+    ExpressionAttributeValues: {
+      ':t': taskToken,
+      ':g': goals,
+    },
   }));
 
   await mediaConvert.send(new CreateJobCommand({
@@ -35,6 +46,7 @@ export const launch = async (event: {
     Settings: {
       Inputs: [{
         FileInput: inputKey,
+        TimecodeSource: 'ZEROBASED',
         InputClippings: timestamps,
         AudioSelectors: { 'Audio Selector 1': { DefaultSelection: 'DEFAULT' } },
       }],

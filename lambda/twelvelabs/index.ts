@@ -38,10 +38,7 @@ export const handler = async (event: {
   }));
 
   const rawString = new TextDecoder().decode(response.body);
-  console.log('Bedrock raw response:', rawString);
-
   const responseBody = JSON.parse(rawString);
-  console.log('Bedrock parsed response:', JSON.stringify(responseBody));
 
   let raw: Array<{ start: string; end: string; label: string }> = [];
   if (Array.isArray(responseBody)) {
