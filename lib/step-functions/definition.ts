@@ -76,7 +76,8 @@ export function buildDefinition(scope: Construct, props: DefinitionProps): sfn.I
 
   launchQualities.addCatch(updateQualitiesFailed, { errors: ['States.ALL'], resultPath: '$.error' });
 
-  const branchA = sfn.Chain.start(launchQualities).next(updateQualitiesDone);
+  // const branchA = sfn.Chain.start(launchQualities).next(updateQualitiesDone); // BRANCH A — descomentar para reactivar
+  const branchA = sfn.Chain.start(new sfn.Succeed(scope, 'SkipQualities')); // TEMPORAL — solo para testear Branch B
 
   // ── Branch B — Análisis + Highlight reel ─────────────────────────────────────
 

@@ -56,10 +56,15 @@ export class FargatePegasus extends Construct {
       resources: ['*'],
     }));
     inputBucket.grantRead(taskRole);
+    inputBucket.grantPut(taskRole);
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['s3:DeleteObject'],
+      resources: [inputBucket.arnForObjects('tmp/*')],
+    }));
 
     this.taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDef', {
-      memoryLimitMiB: 512,
-      cpu: 256,
+      memoryLimitMiB: 4096,
+      cpu: 2048,
       taskRole,
     });
 

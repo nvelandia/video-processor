@@ -41,28 +41,30 @@ export const launch = async (event: {
     },
   }));
 
+  // Un Input por cada clip — evita el error "No audio frames decoded"
+  // que ocurre al usar múltiples InputClippings en un solo Input
+  const inputs = timestamps.map(clip => ({
+    FileInput: inputKey,
+    TimecodeSource: 'ZEROBASED' as const,
+    InputClippings: [clip],
+    AudioSelectors: { 'Audio Selector 1': { DefaultSelection: 'DEFAULT' as const } },
+  }));
+
   await mediaConvert.send(new CreateJobCommand({
     Role: process.env.MEDIACONVERT_ROLE_ARN,
     Settings: {
-      Inputs: [{
-        FileInput: inputKey,
-        TimecodeSource: 'ZEROBASED',
-        InputClippings: timestamps,
-        AudioSelectors: { 'Audio Selector 1': { DefaultSelection: 'DEFAULT' } },
-      }],
+      Inputs: inputs,
       OutputGroups: [{
-        Name: 'Apple HLS',
+        Name: 'File Group',
         OutputGroupSettings: {
-          Type: 'HLS_GROUP_SETTINGS',
-          HlsGroupSettings: {
+          Type: 'FILE_GROUP_SETTINGS',
+          FileGroupSettings: {
             Destination: `${outputVideo}highlights/`,
-            SegmentLength: 6,
-            MinSegmentLength: 0,
           },
         },
         Outputs: [{
-          NameModifier: '_highlight',
-          ContainerSettings: { Container: 'M3U8', M3u8Settings: {} },
+          Extension: 'mp4',
+          ContainerSettings: { Container: 'MP4', Mp4Settings: {} },
           VideoDescription: {
             Width: 1280,
             Height: 720,
@@ -72,6 +74,7 @@ export const launch = async (event: {
             },
           },
           AudioDescriptions: [{
+            AudioSourceName: 'Audio Selector 1',
             CodecSettings: {
               Codec: 'AAC',
               AacSettings: { Bitrate: 96000, CodingMode: 'CODING_MODE_2_0', SampleRate: 48000 },
