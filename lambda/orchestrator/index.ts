@@ -24,7 +24,6 @@ export const handler = async (event: any): Promise<void> => {
     Item: {
       jobId,
       qualitiesStatus: 'PENDING',
-      highlightsStatus: 'PEGASUS',
       outputVideo,
       inputKey,
       createdAt,

@@ -20,8 +20,6 @@ export class Lambdas extends Construct {
   readonly orchestrator: nodejs.NodejsFunction;
   readonly qualitiesLaunch: nodejs.NodejsFunction;
   readonly qualitiesCallback: nodejs.NodejsFunction;
-  readonly highlightsLaunch: nodejs.NodejsFunction;
-  readonly highlightsCallback: nodejs.NodejsFunction;
 
   constructor(scope: Construct, id: string, props: LambdasProps) {
     super(scope, id);
@@ -95,38 +93,5 @@ export class Lambdas extends Construct {
       resources: ['*'],
     }));
     jobsTable.grantReadData(this.qualitiesCallback);
-
-    // ── Highlights ──────────────────────────────────────────────────────────────
-
-    this.highlightsLaunch = new nodejs.NodejsFunction(this, 'HighlightsLaunch', {
-      functionName: `video-processor-${stage}-highlights-launch`,
-      runtime: lambda.Runtime.NODEJS_20_X,
-      entry: path.join(__dirname, '../../lambda/highlights/index.ts'),
-      handler: 'launch',
-      timeout: cdk.Duration.seconds(30),
-      environment: mediaConvertEnv,
-    });
-
-    this.highlightsLaunch.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['mediaconvert:CreateJob', 'iam:PassRole'],
-      resources: ['*'],
-    }));
-    bucket.grantRead(this.highlightsLaunch);
-    jobsTable.grantWriteData(this.highlightsLaunch);
-
-    this.highlightsCallback = new nodejs.NodejsFunction(this, 'HighlightsCallback', {
-      functionName: `video-processor-${stage}-highlights-callback`,
-      runtime: lambda.Runtime.NODEJS_20_X,
-      entry: path.join(__dirname, '../../lambda/highlights/index.ts'),
-      handler: 'callback',
-      timeout: cdk.Duration.seconds(10),
-      environment: { TABLE_NAME: jobsTable.tableName },
-    });
-
-    this.highlightsCallback.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['states:SendTaskSuccess', 'states:SendTaskFailure'],
-      resources: ['*'],
-    }));
-    jobsTable.grantReadData(this.highlightsCallback);
   }
 }
