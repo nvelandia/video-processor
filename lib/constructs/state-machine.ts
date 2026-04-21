@@ -27,7 +27,7 @@ export class StateMachineConstruct extends Construct {
     this.stateMachine = new sfn.StateMachine(this, 'StateMachine', {
       stateMachineName: `video-processor-${stage}-pipeline`,
       definitionBody: sfn.DefinitionBody.fromChainable(definition),
-      timeout: cdk.Duration.hours(2),
+      timeout: cdk.Duration.hours(4),
     });
 
     qualitiesLaunchFn.grantInvoke(this.stateMachine.role);

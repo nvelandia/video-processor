@@ -49,7 +49,6 @@ export class Lambdas extends Construct {
     });
 
     jobsTable.grantWriteData(this.orchestrator);
-    bucket.grantPut(this.orchestrator);
     this.orchestrator.addToRolePolicy(new iam.PolicyStatement({
       actions: ['states:StartExecution'],
       resources: [stateMachineArn],
