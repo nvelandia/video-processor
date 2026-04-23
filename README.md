@@ -39,3 +39,20 @@ cdk deploy --context stage=dev
 npx cdk diff     # Preview de cambios
 npx cdk destroy  # Eliminar stack
 ```
+
+Qué señal detectó el evento:
+AWS_PROFILE=dev-environment npx ts-node scripts/show-goal-events.ts velez-76e62912-15e7-46bb-99e8-9d2a771c8b10
+
+
+crowd_noise — ffmpeg detectó un pico de energía en el audio (la multitud gritó)
+keyword — Transcribe escuchó una palabra clave ("gol", "golazo", etc.)
+visual — Rekognition vio labels de celebración en el video (Celebration, Cheering, Crowd)
+task_token — interno del sistema, no es un evento de gol (es el token de Step Functions)
+
+confidence
+Score de confianza de 0 a 1 de cada señal:
+
+Source	Qué significa el confidence
+crowd_noise	Energía RMS relativa al máximo del segmento (0.9 = muy fuerte)
+keyword	Confianza de Transcribe en que la palabra es correcta (0.99 = muy seguro)
+visual	Confianza de Rekognition en el label / 100 (0.85 = 85%)

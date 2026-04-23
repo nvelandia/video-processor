@@ -6,6 +6,7 @@ import { MediaConvertRole } from '../constructs/mediaconvert-role';
 import { StateMachineConstruct } from '../constructs/state-machine';
 import { Lambdas } from '../constructs/lambdas';
 import { EventBridgeRules } from '../constructs/eventbridge-rules';
+import { GoalsLambdas } from '../constructs/goals-lambdas';
 
 export class VideoProcessorStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -22,26 +23,48 @@ export class VideoProcessorStack extends cdk.Stack {
       bucket: storage.bucket,
     });
 
-    // ── Step Function (necesita Lambdas; se crea en dos pasos) ───────────────────
+    // ── Lambdas (orchestrator + qualities launch/callback) ───────────────────────
+    // stateMachineArn es lazy para romper la dependencia circular entre orchestrator
+    // y state machine.
     const preStateLambdas: Lambdas = new Lambdas(this, 'Lambdas', {
       stage,
-      bucket: storage.bucket,
-      jobsTable: storage.jobsTable,
-      mediaConvertRoleArn: mediaConvertRole.role.roleArn,
+      bucket:               storage.bucket,
+      jobsTable:            storage.jobsTable,
+      mediaConvertRoleArn:  mediaConvertRole.role.roleArn,
       mediaConvertEndpoint: `https://mediaconvert.${this.region}.amazonaws.com`,
-      stateMachineArn: cdk.Lazy.string({ produce: (): string => stateMachineConstruct.stateMachine.stateMachineArn }),
+      stateMachineArn:      cdk.Lazy.string({ produce: (): string => stateMachineConstruct.stateMachine.stateMachineArn }),
     });
 
+    // ── Goals Lambdas (branch B) — se crean antes de la Step Function ────────────
+    const goalsLambdas = new GoalsLambdas(this, 'GoalsLambdas', {
+      stage,
+      bucket:                storage.bucket,
+      jobsTable:             storage.jobsTable,
+      goalsEventsTable:      storage.goalsEventsTable,
+      mediaConvertRoleArn:   mediaConvertRole.role.roleArn,
+      mediaConvertEndpoint:  `https://mediaconvert.${this.region}.amazonaws.com`,
+    });
+
+    // ── Step Function (referencia las lambdas de qualities y goals) ──────────────
     const stateMachineConstruct: StateMachineConstruct = new StateMachineConstruct(this, 'StateMachine', {
       stage,
-      jobsTable: storage.jobsTable,
-      qualitiesLaunchFn: preStateLambdas.qualitiesLaunch,
+      jobsTable:           storage.jobsTable,
+      qualitiesLaunchFn:   preStateLambdas.qualitiesLaunch,
+      splitterFn:          goalsLambdas.splitter,
+      crowdNoiseFn:        goalsLambdas.crowdNoise,
+      transcribeLaunchFn:  goalsLambdas.transcribeLaunch,
+      rekognitionLaunchFn: goalsLambdas.rekognitionLaunch,
+      fusionFn:            goalsLambdas.fusion,
+      highlightLaunchFn:   goalsLambdas.highlightLaunch,
     });
 
     // ── EventBridge Rules ────────────────────────────────────────────────────────
     new EventBridgeRules(this, 'EventBridgeRules', {
       stage,
-      qualitiesCallbackFn: preStateLambdas.qualitiesCallback,
+      qualitiesCallbackFn:      preStateLambdas.qualitiesCallback,
+      transcribeCallbackFn:     goalsLambdas.transcribeCallback,
+      rekognitionCallbackFn:    goalsLambdas.rekognitionCallback,
+      goalsHighlightCallbackFn: goalsLambdas.highlightCallback,
     });
 
     // ── S3 trigger → orchestrator (solo archivos en input/) ───────────────────────
